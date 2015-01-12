@@ -11,15 +11,18 @@
 #import <AVFoundation/AVFoundation.h>
 
 
-@interface AVCaptureManager ()
-<AVCaptureFileOutputRecordingDelegate>
-{
-    CMTime defaultVideoMaxFrameDuration;
-}
+@interface AVCaptureManager () <AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate>
+
+@property (nonatomic, readwrite) BOOL isRecording;
 @property (nonatomic, strong) AVCaptureSession *captureSession;
-@property (nonatomic, strong) AVCaptureMovieFileOutput *fileOutput;
-@property (nonatomic, strong) AVCaptureDeviceFormat *defaultFormat;
+@property (nonatomic, strong) AVAssetWriter *assetWriter;
+@property (nonatomic, strong) AVAssetWriterInput *assetVideoWriterInput;
+@property (nonatomic, strong) AVAssetWriterInput *assetAudioWriterInput;
+@property (nonatomic, strong) AVAssetWriterInputPixelBufferAdaptor *pixelBufferAdaptor;
+@property (nonatomic, strong) AVCaptureVideoDataOutput *videoOutput;
+@property (nonatomic, strong) AVCaptureAudioDataOutput *audioOutput;
 @property (nonatomic, strong) AVCaptureVideoPreviewLayer *previewLayer;
+
 @end
 
 
@@ -31,38 +34,50 @@
     
     if (self) {
         
-        NSError *error;
+        NSError *error = nil;
         
         self.captureSession = [[AVCaptureSession alloc] init];
-        self.captureSession.sessionPreset = AVCaptureSessionPresetInputPriority;
+        [self.captureSession beginConfiguration];
+        [self.captureSession setSessionPreset:AVCaptureSessionPreset352x288];
+        [self initVideoAudioWriter];
         
-        AVCaptureDevice *videoDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-        AVCaptureDeviceInput *videoIn = [AVCaptureDeviceInput deviceInputWithDevice:videoDevice error:&error];
+        AVCaptureDevice * videoDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+        AVCaptureDeviceInput *videoInput = [AVCaptureDeviceInput deviceInputWithDevice:videoDevice error:&error];
+        AVCaptureDevice * audioDevice1 = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice1 error:&error];
         
-        if (error) {
-            NSLog(@"Video input creation failed");
-            return nil;
+        self.videoOutput = [[AVCaptureVideoDataOutput alloc] init];
+        [self.videoOutput setAlwaysDiscardsLateVideoFrames:YES];
+        [self.videoOutput setVideoSettings:[NSDictionary dictionaryWithObject:[NSNumber numberWithInt:kCVPixelFormatType_32BGRA] forKey:(id)kCVPixelBufferPixelFormatTypeKey]];
+        [self.videoOutput setSampleBufferDelegate:self queue:dispatch_get_main_queue()];
+        
+        self.audioOutput = [[AVCaptureAudioDataOutput alloc] init];
+        [self.audioOutput setSampleBufferDelegate:self queue:dispatch_get_main_queue()];
+        
+        [self.captureSession addInput:videoInput];
+        [self.captureSession addInput:audioInput];
+        [self.captureSession addOutput:self.videoOutput];
+        [self.captureSession addOutput:self.audioOutput];
+        
+        [self.captureSession commitConfiguration];
+        
+        AVCaptureConnection *videoConnection = nil;
+        for ( AVCaptureConnection *connection in [self.videoOutput connections] )
+        {
+            NSLog(@"%@", connection);
+            for ( AVCaptureInputPort *port in [connection inputPorts] )
+            {
+                NSLog(@"%@", port);
+                if ( [[port mediaType] isEqual:AVMediaTypeVideo] )
+                {
+                    videoConnection = connection;
+                }
+            }
         }
-        
-        if (![self.captureSession canAddInput:videoIn]) {
-            NSLog(@"Video input add-to-session failed");
-            return nil;
+        if([videoConnection isVideoOrientationSupported]) // **Here it is, its always false**
+        {
+            [videoConnection setVideoOrientation:AVCaptureVideoOrientationPortrait];
         }
-        [self.captureSession addInput:videoIn];
-        
-        
-        // save the default format
-        self.defaultFormat = videoDevice.activeFormat;
-        defaultVideoMaxFrameDuration = videoDevice.activeVideoMaxFrameDuration;
-        
-        
-        AVCaptureDevice *audioDevice= [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        AVCaptureDeviceInput *audioIn = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice error:&error];
-        [self.captureSession addInput:audioIn];
-        
-        self.fileOutput = [[AVCaptureMovieFileOutput alloc] init];
-        [self.captureSession addOutput:self.fileOutput];
-        
         
         self.previewLayer = [[AVCaptureVideoPreviewLayer alloc] initWithSession:self.captureSession];
         self.previewLayer.frame = previewView.bounds;
@@ -71,132 +86,245 @@
         [previewView.layer insertSublayer:self.previewLayer atIndex:0];
         
         [self.captureSession startRunning];
+        
     }
     return self;
 }
 
+#pragma mark -
+#pragma mark - Private
 
+-(void) initVideoAudioWriter
 
-// =============================================================================
-#pragma mark - Public
-
-- (void)toggleContentsGravity {
-    
-    if ([self.previewLayer.videoGravity isEqualToString:AVLayerVideoGravityResizeAspectFill]) {
-    
-        self.previewLayer.videoGravity = AVLayerVideoGravityResizeAspect;
-    }
-    else {
-        self.previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
-    }
-}
-
-- (void)resetFormat {
-
-    BOOL isRunning = self.captureSession.isRunning;
-    
-    if (isRunning) {
-        [self.captureSession stopRunning];
-    }
-
-    AVCaptureDevice *videoDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    [videoDevice lockForConfiguration:nil];
-    videoDevice.activeFormat = self.defaultFormat;
-    videoDevice.activeVideoMaxFrameDuration = defaultVideoMaxFrameDuration;
-    [videoDevice unlockForConfiguration];
-
-    if (isRunning) {
-        [self.captureSession startRunning];
-    }
-}
-
-- (void)switchFormatWithDesiredFPS:(CGFloat)desiredFPS
 {
-    BOOL isRunning = self.captureSession.isRunning;
+    CGSize size = CGSizeMake(320, (320. * 352.) / 288.);
+    NSString *betaCompressionDirectory = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/Movie.mp4"];
+    NSError *error = nil;
+    unlink([betaCompressionDirectory UTF8String]);
     
-    if (isRunning)  [self.captureSession stopRunning];
+    self.assetWriter = [[AVAssetWriter alloc] initWithURL:[NSURL fileURLWithPath:betaCompressionDirectory]
+                                                 fileType:AVFileTypeQuickTimeMovie
+                                                    error:&error];
     
-    AVCaptureDevice *videoDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
-    AVCaptureDeviceFormat *selectedFormat = nil;
-    int32_t maxWidth = 0;
-    AVFrameRateRange *frameRateRange = nil;
-
-    for (AVCaptureDeviceFormat *format in [videoDevice formats]) {
+    NSParameterAssert(self.assetWriter);
+    
+    NSLog(@"error = %@", [error localizedDescription]);
+    
+//    NSDictionary *videoCompressionProps = [NSDictionary dictionaryWithObjectsAndKeys:
+//                                           [NSNumber numberWithDouble:128.0*1024.0], AVVideoAverageBitRateKey,
+//                                           nil ];
+    
+    NSDictionary *videoCompressionProps = [NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithDouble:300.0*1024.0],
+                                           AVVideoAverageBitRateKey ,AVVideoProfileLevelH264High40 /* Or whatever profile & level you wish to use */, AVVideoProfileLevelKey,
+                                           [NSNumber numberWithInt: 3], AVVideoMaxKeyFrameIntervalKey,nil];
+    
+    
+    
+    NSDictionary *videoSettings = [NSDictionary dictionaryWithObjectsAndKeys:AVVideoCodecH264, AVVideoCodecKey,
+                                   [NSNumber numberWithInt:size.width], AVVideoWidthKey,
+                                   [NSNumber numberWithInt:size.height], AVVideoHeightKey,videoCompressionProps, AVVideoCompressionPropertiesKey, nil];
+    
+    self.assetVideoWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:videoSettings];
+    NSParameterAssert(self.assetVideoWriterInput);
+    self.assetVideoWriterInput.expectsMediaDataInRealTime = YES;
+    
+    NSDictionary *sourcePixelBufferAttributesDictionary = [NSDictionary dictionaryWithObjectsAndKeys:
+                                                           [NSNumber numberWithInt:kCVPixelFormatType_32ARGB], kCVPixelBufferPixelFormatTypeKey, nil];
+    
+    self.pixelBufferAdaptor = [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:self.assetVideoWriterInput
+                                                                                               sourcePixelBufferAttributes:sourcePixelBufferAttributesDictionary];
+    
+    NSParameterAssert(self.assetVideoWriterInput);
+    
+    NSParameterAssert([self.assetWriter canAddInput:self.assetVideoWriterInput]);
+    
+    if ([self.assetWriter canAddInput:self.assetVideoWriterInput])
         
-        for (AVFrameRateRange *range in format.videoSupportedFrameRateRanges) {
-            
-            CMFormatDescriptionRef desc = format.formatDescription;
-            CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(desc);
-            int32_t width = dimensions.width;
-
-            if (range.minFrameRate <= desiredFPS && desiredFPS <= range.maxFrameRate && width >= maxWidth) {
-                
-                selectedFormat = format;
-                frameRateRange = range;
-                maxWidth = width;
-            }
-        }
-    }
+        NSLog(@"I can add this input");
     
-    if (selectedFormat) {
+    else
         
-        if ([videoDevice lockForConfiguration:nil]) {
-            
-            NSLog(@"selected format:%@", selectedFormat);
-            videoDevice.activeFormat = selectedFormat;
-            videoDevice.activeVideoMinFrameDuration = CMTimeMake(1, (int32_t)desiredFPS);
-            videoDevice.activeVideoMaxFrameDuration = CMTimeMake(1, (int32_t)desiredFPS);
-            [videoDevice unlockForConfiguration];
-        }
-    }
+        NSLog(@"i can't add this input");
     
-    if (isRunning) [self.captureSession startRunning];
+    
+    
+    
+    // Add the audio input
+    
+    AudioChannelLayout acl;
+    
+    bzero( &acl, sizeof(acl));
+    
+    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+    
+    
+    
+    NSDictionary* audioOutputSettings = nil;
+    
+    //    audioOutputSettings = [ NSDictionary dictionaryWithObjectsAndKeys:
+    
+    //                           [ NSNumber numberWithInt: kAudioFormatAppleLossless ], AVFormatIDKey,
+    
+    //                           [ NSNumber numberWithInt: 16 ], AVEncoderBitDepthHintKey,
+    
+    //                           [ NSNumber numberWithFloat: 44100.0 ], AVSampleRateKey,
+    
+    //                           [ NSNumber numberWithInt: 1 ], AVNumberOfChannelsKey,
+    
+    //                           [ NSData dataWithBytes: &acl length: sizeof( acl ) ], AVChannelLayoutKey,
+    
+    //                           nil ];
+    
+    audioOutputSettings = [ NSDictionary dictionaryWithObjectsAndKeys:
+                           
+                           [ NSNumber numberWithInt: kAudioFormatMPEG4AAC ], AVFormatIDKey,
+                           
+                           [ NSNumber numberWithInt:64000], AVEncoderBitRateKey,
+                           
+                           [ NSNumber numberWithFloat: 44100.0 ], AVSampleRateKey,
+                           
+                           [ NSNumber numberWithInt: 1 ], AVNumberOfChannelsKey,                                      
+                           
+                           [ NSData dataWithBytes: &acl length: sizeof( acl ) ], AVChannelLayoutKey,
+                           
+                           nil ];
+    
+    self.assetAudioWriterInput = [AVAssetWriterInput
+                         assetWriterInputWithMediaType: AVMediaTypeAudio
+                         outputSettings: audioOutputSettings];
+    self.assetAudioWriterInput.expectsMediaDataInRealTime = YES;
+    
+    // add input
+    [self.assetWriter addInput:self.assetVideoWriterInput];
+    [self.assetWriter addInput:self.assetAudioWriterInput];
+    
 }
+
+#pragma mark -
+#pragma mark - Memeber
 
 - (void)startRecording {
     
-    NSDateFormatter* formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd-HH-mm-ss"];
-    NSString* dateTimePrefix = [formatter stringFromDate:[NSDate date]];
+    if (self.isRecording) {
+        return;
+    }
     
-    int fileNamePostfix = 0;
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString *documentsDirectory = [paths objectAtIndex:0];
-    NSString *filePath = nil;
-    do
-        filePath =[NSString stringWithFormat:@"/%@/%@-%i.mp4", documentsDirectory, dateTimePrefix, fileNamePostfix++];
-    while ([[NSFileManager defaultManager] fileExistsAtPath:filePath]);
+    self.isRecording = YES;
     
-    NSURL *fileURL = [NSURL URLWithString:[@"file://" stringByAppendingString:filePath]];
-    [self.fileOutput startRecordingToOutputFileURL:fileURL recordingDelegate:self];
 }
 
 - (void)stopRecording {
 
-    [self.fileOutput stopRecording];
-}
-
-
-// =============================================================================
-#pragma mark - AVCaptureFileOutputRecordingDelegate
-
-- (void)                 captureOutput:(AVCaptureFileOutput *)captureOutput
-    didStartRecordingToOutputFileAtURL:(NSURL *)fileURL
-                       fromConnections:(NSArray *)connections
-{
-    _isRecording = YES;
-}
-
-- (void)                 captureOutput:(AVCaptureFileOutput *)captureOutput
-   didFinishRecordingToOutputFileAtURL:(NSURL *)outputFileURL
-                       fromConnections:(NSArray *)connections error:(NSError *)error
-{
-//    [self saveRecordedFile:outputFileURL];
-    _isRecording = NO;
-    
-    if ([self.delegate respondsToSelector:@selector(didFinishRecordingToOutputFileAtURL:error:)]) {
-        [self.delegate didFinishRecordingToOutputFileAtURL:outputFileURL error:error];
+//    [self.fileOutput stopRecording];
+    __weak typeof(self) weakSelf = self;
+    if ([_assetWriter respondsToSelector:@selector(finishWritingWithCompletionHandler:)]) {
+        // Running iOS 6
+        [_assetWriter finishWritingWithCompletionHandler:^{
+            weakSelf.isRecording = NO;
+        }];
     }
+    else {
+        // Not running iOS 6
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [_assetWriter finishWriting];
+        self.isRecording = NO;
+#pragma clang diagnostic pop
+    }
+    
+}
+
+#pragma mark -
+#pragma mark - AVCaptureVideoDataOutputSampleBufferDelegate
+
+- (void)captureOutput:(AVCaptureOutput *)captureOutput didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
+{
+    if (!self.isRecording) {
+        return;
+    }
+    
+    static int frame = 0;
+    
+    CMTime lastSampleTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    
+        if( frame == 0 && self.assetWriter.status != AVAssetWriterStatusWriting  )
+    
+        {
+    
+            [self.assetWriter startWriting];
+    
+            [self.assetWriter startSessionAtSourceTime:lastSampleTime];
+    
+        }
+    
+    if (captureOutput == self.videoOutput)
+        
+    {
+        if( self.assetWriter.status > AVAssetWriterStatusWriting )
+            
+        {
+            
+            NSLog(@"Warning: writer status is %d", self.assetWriter.status);
+            
+            if( self.assetWriter.status == AVAssetWriterStatusFailed )
+                
+                NSLog(@"Error: %@", self.assetWriter.error);
+            
+            return;
+            
+        }
+        
+        if ([self.assetVideoWriterInput isReadyForMoreMediaData])
+            
+            if( ![self.assetVideoWriterInput appendSampleBuffer:sampleBuffer] )
+                
+                NSLog(@"Unable to write to video input");
+        
+            else
+                
+                NSLog(@"already write vidio");
+        
+        
+    }
+    
+    else if (captureOutput == self.audioOutput)
+    {
+        
+        if( self.assetWriter.status > AVAssetWriterStatusWriting )
+            
+        {
+            
+            NSLog(@"Warning: writer status is %d", self.assetWriter.status);
+            
+            if( self.assetWriter.status == AVAssetWriterStatusFailed )
+                
+                NSLog(@"Error: %@", self.assetWriter.error);
+            
+            return;
+            
+        }
+        
+        
+        if ([self.assetAudioWriterInput isReadyForMoreMediaData])
+            
+            if( ![self.assetAudioWriterInput appendSampleBuffer:sampleBuffer] )
+                
+                NSLog(@"Unable to write to audio input");
+        
+            else
+                
+                NSLog(@"already write audio");
+        
+    }
+    
+    //    if (frame == FrameCount)
+    //
+    //    {
+    //    
+    //        [self closeVideoWriter];
+    //    
+    //    }
+
 }
 
 @end
